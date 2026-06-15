@@ -555,6 +555,53 @@ def is_config_complete(data: dict[str, str] | None = None) -> bool:
     return has_model and has_provider
 
 
+def seed_env_from_os_environ() -> None:
+    """First-boot convenience: when the persisted ``.env`` is missing/incomplete,
+    seed model + provider (and channel) values from the process environment
+    (i.e. Railway service variables) so a fresh deploy comes up configured
+    without the dashboard wizard.
+
+    Strictly additive and idempotent:
+      * No-op once ``.env`` is already a complete config (values on the volume
+        always win — e.g. an onboarded service is never touched).
+      * Never overwrites a key that already exists in ``.env``.
+      * Only writes when the merged result is actually a complete config; if env
+        doesn't provide enough, ``.env`` is left for dashboard onboarding.
+    """
+    current = read_env(ENV_FILE)
+    if is_config_complete(current):
+        return  # already configured on the volume — leave it untouched
+
+    accepted = {k for k, _, _, _ in ENV_VARS} | set(CHANNEL_MAP.values())
+    additions: dict[str, str] = {}
+    for k in accepted:
+        if current.get(k):
+            continue  # .env wins — never overwrite
+        v = os.environ.get(k, "").strip()
+        if v:
+            additions[k] = v
+
+    merged = {**additions, **current}  # .env values take priority
+    if not is_config_complete(merged):
+        if additions:
+            print(f"[server] Seeded {len(additions)} value(s) from env, but config still "
+                  "incomplete — finish setup in the admin UI.", flush=True)
+        return
+
+    # Mirror the dashboard's _MODEL_<KEY> bookkeeping for the provider that backs
+    # the chosen model (e.g. deepseek/… -> _MODEL_DEEPSEEK_API_KEY=<model>).
+    model = merged.get("LLM_MODEL", "")
+    if model and "/" in model:
+        prov_key = f"{model.split('/', 1)[0].upper()}_API_KEY"
+        if merged.get(prov_key) and not merged.get(f"_MODEL_{prov_key}"):
+            merged[f"_MODEL_{prov_key}"] = model
+            additions[f"_MODEL_{prov_key}"] = model
+
+    write_env(ENV_FILE, merged)
+    print(f"[server] Seeded .env from environment ({', '.join(sorted(additions))}) "
+          "— gateway will start.", flush=True)
+
+
 def mask(data: dict[str, str]) -> dict[str, str]:
     return {
         k: (v[:8] + "***" if len(v) > 8 else "***") if k in SECRET_KEYS and v else v
@@ -1334,6 +1381,10 @@ async def route_setup_404(request: Request) -> Response:
 
 # ── App lifecycle ─────────────────────────────────────────────────────────────
 async def auto_start():
+    try:
+        seed_env_from_os_environ()
+    except Exception as e:  # never let a seed hiccup block boot
+        print(f"[server] env seed skipped ({e!r})", flush=True)
     if is_config_complete():
         asyncio.create_task(gw.start())
     else:
